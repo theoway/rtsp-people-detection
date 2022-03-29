@@ -14,6 +14,7 @@ from deep_sort.tracker import Tracker
 from deep_sort import nn_matching
 
 import threading
+import queue
 import operator
 
 import warnings
@@ -51,6 +52,7 @@ class ObjectDetection:
         self.classes = self.model.names
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.devices = devices
+        self.feats_queue = queue.Queue()
         print("Using Device: ", self.device)
 
     def get_video_capture(self):
@@ -109,6 +111,17 @@ class ObjectDetection:
                 cv2.putText(frame, self.class_to_label(labels[i]), (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.9, bgr, 2)
 
         return frame
+    
+    def _extract_features(self, feats, q) -> None:
+        global reid, stop_threads
+        print("Extracting thread has started!!!!!!!!")
+        while not stop_threads:
+            if not q.empty():
+                id, images = q.get()
+                feats[id] = reid._features(images)
+                print("Person ID: ", id, '\n', "Feature length: ", feats[id].shape[0])
+
+        print("Exiting extracting thread!!!!!!!!")
 
     def detection_on_stream(self, device, url):
         """
@@ -131,7 +144,7 @@ class ObjectDetection:
         frame_cnt = 0
         ids_per_frame = []
         images_by_id[device] = dict()
-
+        
         def box_transform(box: list, shape: tuple):
             """
             shape: (frame.shape[1], frame.shape[0])
@@ -162,9 +175,12 @@ class ObjectDetection:
         while True:
             track_cnt = dict()
             
+            t1 = time()
             ret, frame = cap.read()
             assert ret
+            print("Frame reading time: ", time() - t1)
             
+            t1 = time()
             results = self.score_frame(frame)
             #frame = self.plot_boxes(results, frame)
             
@@ -173,7 +189,9 @@ class ObjectDetection:
             features = encoder(frame, boxs) # n * 128
             detections = [Detection(bbox, 1.0, feature) for bbox, feature in zip(boxs, features)] # length = n
             text_scale, text_thickness, line_thickness = get_FrameLabels(frame)
+            print("YOLO detection time: ", time() - t1)
 
+            t1 = time()
             tracker.predict()
             tracker.update(detections)
             tmp_ids = []
@@ -195,11 +213,20 @@ class ObjectDetection:
                         images_by_id[device][ids].append(frame[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])])
             ids_per_frame.append(set(tmp_ids))
             print("IDs per frame: ", ids_per_frame)
+            print("Object tracking time: ", time() - t1)
 
             for i in images_by_id[device]:
-                print('ID number {} -> Number of images {}'.format(i, len(images_by_id[device][i])))
+                self.feats_queue.put((i, images_by_id[device][i]))
+            '''for i in images_by_id[device]:
+                #print('ID number {} -> Number of images {}'.format(i, len(images_by_id[device][i])))
+                t1 = time()
                 feats[i] = reid._features(images_by_id[device][i])
+                print("---------------------")
+                print(feats[i])
+                print(feats[i].shape[0])
+                print("Feature generation time for ID ", i ," : ", time() - t1)'''
 
+            t1 = time()
             for f in ids_per_frame:
                 if f:
                     if len(exist_ids) == 0:
@@ -211,7 +238,7 @@ class ObjectDetection:
                         new_ids = f - exist_ids
                         for nid in new_ids:
                             dis = []
-                            if len(images_by_id[device][nid]) < 10:
+                            if not nid in feats.keys() or feats[nid].shape[0] < 10:
                                 exist_ids.add(nid)
                                 continue
                             unpickable = []
@@ -243,7 +270,7 @@ class ObjectDetection:
                                     unpickable += final_fuse_id[key]
                         for left_out_id in f & (exist_ids - set(unpickable)):
                             dis = []
-                            if len(images_by_id[device][left_out_id]) < 10:
+                            if not left_out_id in feats.keys() or feats[left_out_id].shape[0] < 10:
                                 continue
                             for main_id in final_fuse_id.keys():
                                 tmp = np.mean(reid.compute_distance(feats[left_out_id],feats[main_id]))
@@ -263,7 +290,9 @@ class ObjectDetection:
                             else:
                                 print("New ID added: ", left_out_id)
                                 final_fuse_id[left_out_id] = [left_out_id]
+            print("REID time: ", time() - t1)
 
+            t1 = time()
             print('Final ids and their sub-ids:', final_fuse_id)
             for idx in final_fuse_id:
                 for i in final_fuse_id[idx]:
@@ -276,13 +305,18 @@ class ObjectDetection:
                                 detection_track = track_cnt[f][0]
                                 print("ID Matched: ", f)
                                 cv2_addBox(idx, frame, detection_track[1], detection_track[2], detection_track[3], detection_track[4], line_thickness, text_thickness, text_scale)         
+            print("Fusion time: ", time() - t1)
 
             del ids_per_frame[:]
+
+            t1 = time()
             cv2.imshow("Device-{}".format(device), frame)
- 
+            print("Frame display time: ", time() - t1)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-      
+        global stop_threads
+        stop_threads = True
         cap.release()
 
     def __call__(self):
@@ -291,11 +325,14 @@ class ObjectDetection:
         and displays the results
         :return: void
         """
+        global feats
         self.threads = {}
-        #Creating threads
+        #Creating detection threads
         for d, u in self.devices.items():
             self.threads[d] = threading.Thread(target=self.detection_on_stream, args=(d, u))
-        #Starting threads
+        #Create one thread for extracting features
+        self.threads["extract"] = threading.Thread(target=self._extract_features, args=(feats, self.feats_queue))
+        #Starting detection threads
         for d in self.threads:
             self.threads[d].start()
         
@@ -323,8 +360,10 @@ exist_ids = set()
 images_by_id = dict()
 final_fuse_id = dict()
 feats = dict()
+stop_threads = False
 
 # Create a new object and execute.
 #, 2: "192.168.43.112:8080"
-detector = ObjectDetection(capture_index=0, devices={1: "192.168.83.231:8080", 2: "192.168.83.112:8080"})
+detector = ObjectDetection(capture_index=0, devices={1: "192.168.255.50:8080", 2: "192.168.255.112:8080"})
+#detector = ObjectDetection(capture_index=0, devices={1: "192.168.255.50:8080"})
 detector()
